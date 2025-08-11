@@ -57,3 +57,4 @@ streamlit
 transformers
 torch
 sentencepiece
+```
