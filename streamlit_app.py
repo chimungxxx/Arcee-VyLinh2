@@ -1,65 +1,75 @@
 # app.py
 import streamlit as st
-from translator import Translator, TranslatorManager
-import os
+from local_translator import Translator, TranslatorManager
 import torch
+import os
 
-st.set_page_config(page_title="Local Chinese→Vietnamese Translator", layout="wide")
+st.set_page_config(page_title="Local Chinese → Vietnamese (no sentencepiece)", layout="wide")
+st.title("Local Chinese → Vietnamese translator (tries to avoid sentencepiece)")
 
-st.title("Local Chinese → Vietnamese translator (no API token)")
-
-col1, col2 = st.columns([2, 1])
+col1, col2 = st.columns([3, 1])
 
 with col1:
-    model_input = st.text_input(
-        "Hugging Face model id or local path",
-        value="arcee-ai/Arcee-VyLinh",
-        help="Examples: 'arcee-ai/Arcee-VyLinh' or a local folder path where model is already downloaded."
-    )
-    chinese_text = st.text_area("Chinese text to translate", height=240, placeholder="例如：今天天气很好，我们去公园吧。")
-    max_length = st.number_input("Max tokens / output length", min_value=32, max_value=2048, value=256, step=16)
-    device_select = st.selectbox("Device", options=["auto", "cuda", "cpu"], index=0)
-    if device_select == "auto":
-        device = None
-    else:
-        device = device_select
+    model_id = st.text_input("Hugging Face model id or local path", value="arcee-ai/Arcee-VyLinh")
+    text_in = st.text_area("Chinese text to translate", height=260, placeholder="例如：今天天气很好，我们去公园吧。")
+    max_len = st.number_input("Max output tokens", min_value=32, max_value=2048, value=256, step=16)
+    run_translate = st.button("Translate (local)")
 
 with col2:
-    st.markdown("## Options")
-    st.write(f"Local models base folder: `./local_translator_models`")
-    use_manager = st.checkbox("Load as TranslatorManager (multiple models)", value=False)
-    if use_manager:
-        extra_models = st.text_area("Additional model ids (one per line)", height=120, placeholder="one per line")
+    st.markdown("## Options & info")
+    st.write(f"Local models folder: `./local_translator_models`")
+    device_choice = st.selectbox("Device", options=["auto", "cuda", "cpu"], index=0)
+    device = None if device_choice == "auto" else device_choice
     st.write("---")
-    st.write("Info")
-    st.write(f"torch device available: {torch.cuda.is_available()}")
-    st.write(f"Current Python process device selection: {device or 'auto (cuda if available else cpu)'}")
+    st.write(f"CUDA available: {torch.cuda.is_available()}")
+    st.markdown(
+        "### Notes\n"
+        "- This app prefers the *fast* tokenizer (no `sentencepiece`) but may still require sentencepiece for some models.\n"
+        "- If you can't install sentencepiece on your environment, pre-download the model + tokenizer on another machine\n"
+        "  (where sentencepiece can be installed) and copy the folder into `./local_translator_models/<model_name>/`.\n"
+        "- First-time model downloads will take time and disk space."
+    )
 
-translate_btn = st.button("Translate (local)")
+# caching loaded translator so Streamlit doesn't reload every interaction
+# key uses model_id + device to support multiple model choices
+@st.cache_resource
+def get_translator_cached(model_id, device):
+    return Translator(model_id, device=device)
 
-if translate_btn:
-    if not model_input.strip():
+@st.cache_resource
+def get_manager_cached(model_list, device):
+    return TranslatorManager(model_list, device=device)
+
+if run_translate:
+    if not model_id.strip():
         st.error("Please provide a model id or local path.")
-    elif not chinese_text.strip():
-        st.error("Please paste some Chinese text to translate.")
+    elif not text_in.strip():
+        st.error("Please provide Chinese text to translate.")
     else:
-        with st.spinner("Loading model and translating (this may take a while the first time)..."):
-            try:
-                if use_manager:
-                    model_list = [model_input.strip()] + [m.strip() for m in extra_models.splitlines() if m.strip()]
-                    manager = TranslatorManager(model_list)
-                    results = manager.translate_all(chinese_text.strip())
+        try:
+            with st.spinner("Loading model (if not cached) and translating — this may take a while on first run..."):
+                if "\n" in model_id.strip():
+                    # if user pasted multiple models (one per line), treat as manager
+                    model_list = [m.strip() for m in model_id.splitlines() if m.strip()]
+                    manager = get_manager_cached(tuple(model_list), device)
+                    results = manager.translate_all(text_in.strip())
                     for name, out in results.items():
                         st.subheader(name)
-                        if out and out.startswith("Error"):
+                        if isinstance(out, str) and out.lower().startswith("error"):
                             st.error(out)
                         else:
                             st.code(out)
                 else:
-                    translator = Translator(model_input.strip(), device=device)
-                    result = translator.translate(chinese_text.strip(), max_length=int(max_length))
-                    st.subheader("Translation")
+                    trans = get_translator_cached(model_id.strip(), device)
+                    result = trans.translate(text_in.strip(), max_length=int(max_len))
+                    st.subheader("Vietnamese translation")
                     st.code(result)
-                    st.download_button("Download translation (.txt)", data=result.encode("utf-8"), file_name="translation_vi.txt")
-            except Exception as e:
-                st.exception(e)
+                    st.download_button("Download (.txt)", data=result.encode("utf-8"), file_name="translation_vi.txt")
+        except Exception as e:
+            st.error("Error: " + str(e))
+            # show hint for advanced users
+            st.markdown(
+                "<small>Hint: if the error mentions 'sentencepiece', either install it (conda recommended) or pre-download the "
+                "tokenizer.json/tokenizer files on another machine and copy them into the local model folder.</small>",
+                unsafe_allow_html=True
+            )
