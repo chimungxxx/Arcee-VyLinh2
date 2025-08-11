@@ -1,6 +1,5 @@
-transformers
-torch
-sentencepiece
-huggingface-hub
-bitsandbytes
-accelerate
+transformers>=4.30
+torch>=1.13
+huggingface-hub>=0.14
+# NOTE: intentionally omitted `sentencepiece` here. If a model truly requires it,
+# you will need to install sentencepiece or pre-download tokenizer.json as described.
