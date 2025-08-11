@@ -1,7 +1,7 @@
 # local_translator.py
 """
-Local translator loader (Sailor-1.8B only) with detailed server logging.
-- Model: sail/Sailor-1.8B (hardcoded default)
+Local translator loader (Sailor-0.5B only) with detailed server logging.
+- Model: sail/Sailor-0.5B (hardcoded default)
 - Tries to prefer fast tokenizer (avoid sentencepiece)
 - Attempts 4-bit quantized load if CUDA + bitsandbytes present (reduces VRAM)
 - Logs steps and decisions to stdout via logging module (server logs)
@@ -29,7 +29,7 @@ if not logger.handlers:
     # Basic configuration - server collects stdout/stderr
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 
-MODEL_ID = "sail/Sailor-1.8B"  # <- fixed to Sailor 1.8B
+MODEL_ID = "sail/Sailor-0.5B"  # <- fixed to Sailor 1.8B
 
 
 def safe_auto_tokenizer(pretrained_or_local: str, use_fast_prefer: bool = True, **kwargs) -> AutoTokenizer:
@@ -263,7 +263,7 @@ class Translator:
 
 class TranslatorManager:
     def __init__(self, model_names=None, **kwargs):
-        # Force single model usage (Sailor-1.8B) regardless of model_names parameter
+        # Force single model usage (Sailor-0.5B) regardless of model_names parameter
         self.model_id = MODEL_ID
         logger.info("TranslatorManager init (forced model=%s)", self.model_id)
         self.translators = {}
