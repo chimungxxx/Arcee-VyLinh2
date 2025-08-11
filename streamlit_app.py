@@ -9,8 +9,8 @@ logger = logging.getLogger("sail_translator_app")
 if not logger.handlers:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 
-st.set_page_config(page_title="Sailor-1.8B Chinese→Vietnamese", layout="wide")
-st.title("Local Chinese → Vietnamese — sail/Sailor-1.8B (fixed)")
+st.set_page_config(page_title="Sailor-0.5B Chinese→Vietnamese", layout="wide")
+st.title("Local Chinese → Vietnamese — sail/Sailor-0.5B (fixed)")
 
 st.markdown(f"**Model (fixed):** `{MODEL_ID}`")
 
@@ -25,7 +25,7 @@ with col2:
     st.write(f"CUDA available: {torch.cuda.is_available()}")
     prefer_4bit = st.checkbox("Prefer 4-bit quantized load (requires bitsandbytes + CUDA)", value=True)
     st.markdown(
-        "- The model is fixed to `sail/Sailor-1.8B` to reduce memory footprint compared to larger LLMs.\n"
+        "- The model is fixed to `sail/Sailor-0.5B` to reduce memory footprint compared to larger LLMs.\n"
         "- Logs about downloading/loading appear in the server logs (stdout/stderr). Check your cloud provider's log viewer.\n"
     )
 
@@ -51,6 +51,6 @@ if run_btn:
             st.error("Error: " + str(e))
             st.markdown(
                 "<small>See server logs for full debug messages. If the error mentions 'weights' or 'offline', you may need to pre-download\n"
-                "the model weights on another machine and copy the model folder to `./local_translator_models/sail_Sailor-1.8B/`.</small>",
+                "the model weights on another machine and copy the model folder to `./local_translator_models/sail_Sailor-0.5B/`.</small>",
                 unsafe_allow_html=True,
             )
