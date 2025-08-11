@@ -1,6 +1,6 @@
 # app.py
 import streamlit as st
-from local_translator import Translator, TranslatorManager
+from translator import Translator, TranslatorManager
 import os
 import torch
 
