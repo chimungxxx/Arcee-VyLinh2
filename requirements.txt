@@ -1,5 +1,5 @@
-transformers>=4.30
-torch>=1.13
+transformers
+torch
 sentencepiece
 huggingface-hub
 bitsandbytes
