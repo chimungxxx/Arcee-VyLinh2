@@ -1,0 +1,177 @@
+# local_translator.py
+import os
+import shutil
+import torch
+from transformers import (
+    AutoTokenizer,
+    AutoConfig,
+    AutoModelForSeq2SeqLM,
+    AutoModelForCausalLM,
+)
+from typing import Tuple
+
+class Translator:
+    """
+    Loads a HF model locally (downloads if necessary) and provides a translate() method.
+    Works for seq2seq and causal models.
+    """
+
+    SEQ2SEQ_TYPES = {"t5", "mt5", "mbart", "marian", "m2m_100", "fsmt", "pegasus"}
+
+    def __init__(self, hf_model_name: str, local_base: str = None, device: str = None):
+        """
+        hf_model_name: huggingface repo id (e.g. "arcee-ai/Arcee-VyLinh") or a local path
+        local_base: parent folder where model subfolders are stored (default: ./local_translator_models)
+        device: "cpu", "cuda", or None (auto-detect)
+        """
+        self.HF_MODEL_NAME = hf_model_name
+        self.script_dir = os.path.dirname(os.path.abspath(__file__))
+        self.local_base = local_base or os.path.join(self.script_dir, "local_translator_models")
+        os.makedirs(self.local_base, exist_ok=True)
+
+        # sanitize local folder name for the model
+        self.LOCAL_MODEL_DIR = os.path.join(self.local_base, self.HF_MODEL_NAME.replace("/", "_"))
+
+        if device is None:
+            self.DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        else:
+            self.DEVICE = torch.device(device)
+
+        # If model already present, we try to load from local dir. Otherwise download & save to local dir.
+        self.ensure_model_local()
+
+        # Load config to detect model type
+        self.config = AutoConfig.from_pretrained(self.LOCAL_MODEL_DIR)
+        if getattr(self.config, "model_type", "").lower() in self.SEQ2SEQ_TYPES:
+            self.model_type = "seq2seq"
+            self.tokenizer, self.model = self.load_seq2seq()
+        else:
+            self.model_type = "causal"
+            self.tokenizer, self.model = self.load_causal()
+
+    def ensure_model_local(self):
+        """
+        Ensure model files exist in LOCAL_MODEL_DIR. If not, download from HF and save to LOCAL_MODEL_DIR.
+        Uses transformers.from_pretrained to download then save_pretrained to local dir.
+        """
+        # if local dir exists and has tokenizer files, assume ok
+        if os.path.isdir(self.LOCAL_MODEL_DIR) and os.listdir(self.LOCAL_MODEL_DIR):
+            try:
+                AutoTokenizer.from_pretrained(self.LOCAL_MODEL_DIR)
+                return
+            except Exception:
+                # corrupted or incomplete, remove and re-download
+                shutil.rmtree(self.LOCAL_MODEL_DIR, ignore_errors=True)
+
+        # Download tokenizer + model from HF hub (public models only require no token)
+        # Note: this will use the default HF cache and internet access.
+        print(f"[Translator] Downloading model/tokenizer for '{self.HF_MODEL_NAME}' ...")
+        tokenizer = AutoTokenizer.from_pretrained(self.HF_MODEL_NAME, use_fast=True)
+        # pick download class based on config detection
+        try:
+            cfg = AutoConfig.from_pretrained(self.HF_MODEL_NAME)
+            if cfg.model_type in self.SEQ2SEQ_TYPES:
+                model = AutoModelForSeq2SeqLM.from_pretrained(self.HF_MODEL_NAME)
+            else:
+                model = AutoModelForCausalLM.from_pretrained(self.HF_MODEL_NAME)
+        except Exception:
+            # fallback: try Seq2Seq then causal
+            try:
+                model = AutoModelForSeq2SeqLM.from_pretrained(self.HF_MODEL_NAME)
+            except Exception:
+                model = AutoModelForCausalLM.from_pretrained(self.HF_MODEL_NAME)
+
+        # Save into a simple local folder for repeatable loads
+        os.makedirs(self.LOCAL_MODEL_DIR, exist_ok=True)
+        tokenizer.save_pretrained(self.LOCAL_MODEL_DIR)
+        model.save_pretrained(self.LOCAL_MODEL_DIR)
+        # Save config as well
+        cfg = model.config
+        cfg.save_pretrained(self.LOCAL_MODEL_DIR)
+        print(f"[Translator] Saved model to {self.LOCAL_MODEL_DIR}")
+
+    def load_seq2seq(self) -> Tuple[AutoTokenizer, AutoModelForSeq2SeqLM]:
+        tokenizer = AutoTokenizer.from_pretrained(self.LOCAL_MODEL_DIR, use_fast=True)
+        # try to use automatic device mapping for large models if supported
+        try:
+            model = AutoModelForSeq2SeqLM.from_pretrained(
+                self.LOCAL_MODEL_DIR,
+            )
+            model.to(self.DEVICE)
+        except Exception as e:
+            # fallback simple load
+            model = AutoModelForSeq2SeqLM.from_pretrained(self.LOCAL_MODEL_DIR).to(self.DEVICE)
+        return tokenizer, model
+
+    def load_causal(self) -> Tuple[AutoTokenizer, AutoModelForCausalLM]:
+        tokenizer = AutoTokenizer.from_pretrained(self.LOCAL_MODEL_DIR, use_fast=True)
+        try:
+            model = AutoModelForCausalLM.from_pretrained(
+                self.LOCAL_MODEL_DIR,
+            )
+            model.to(self.DEVICE)
+        except Exception:
+            model = AutoModelForCausalLM.from_pretrained(self.LOCAL_MODEL_DIR).to(self.DEVICE)
+        return tokenizer, model
+
+    def translate(self, text: str, max_length: int = 256, **generate_kwargs) -> str:
+        """
+        Translate text. If seq2seq model: assume model expects source text directly.
+        If causal model: build a simple instruction prompt for Chinese -> Vietnamese.
+        Additional generation kwargs are passed to model.generate.
+        """
+        if not text or not text.strip():
+            return ""
+
+        # Keep inputs modest length; tokenizer will truncate if requested
+        if self.model_type == "seq2seq":
+            inputs = self.tokenizer(
+                text,
+                return_tensors="pt",
+                truncation=True,
+                padding=True,
+                max_length=1024
+            ).to(self.DEVICE)
+            gen_kwargs = dict(max_length=max_length, num_beams=4, early_stopping=True)
+            gen_kwargs.update(generate_kwargs)
+            outputs = self.model.generate(**inputs, **gen_kwargs)
+            decoded = self.tokenizer.batch_decode(outputs, skip_special_tokens=True)[0]
+            return decoded.strip()
+        else:
+            # causal: instruction-style prompt. Some causal models are instruction-tuned.
+            prompt = (
+                "Translate the following Chinese text into natural Vietnamese. "
+                "Keep names as-is where appropriate.\n\n"
+                f"Chinese: {text}\n\nVietnamese:"
+            )
+            inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True, padding=True).to(self.DEVICE)
+            gen_kwargs = dict(max_new_tokens=max_length, do_sample=False, temperature=0.2)
+            gen_kwargs.update(generate_kwargs)
+            outputs = self.model.generate(**inputs, **gen_kwargs)
+            decoded = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+            # try to extract after "Vietnamese:" marker
+            if "Vietnamese:" in decoded:
+                return decoded.split("Vietnamese:", 1)[1].strip()
+            # fallback - attempt to remove the prompt
+            return decoded[len(prompt):].strip()
+
+class TranslatorManager:
+    def __init__(self, model_names):
+        self.translators = {}
+        for name in model_names:
+            try:
+                self.translators[name] = Translator(name)
+            except Exception as e:
+                self.translators[name] = f"Error loading model: {e}"
+
+    def translate_all(self, text: str):
+        results = {}
+        for name, translator in self.translators.items():
+            if isinstance(translator, Translator):
+                try:
+                    results[name] = translator.translate(text)
+                except Exception as e:
+                    results[name] = f"Error during translate: {e}"
+            else:
+                results[name] = str(translator)
+        return results
