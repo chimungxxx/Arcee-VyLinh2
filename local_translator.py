@@ -1,13 +1,15 @@
 # local_translator.py
 """
-Local translator loader adapted for sail/Sailor-4B with optional 4-bit quantization.
-- Prefers fast tokenizer (use_fast=True) to avoid sentencepiece when possible.
-- If CUDA+bitsandbytes available, attempts to load model in 4-bit (very memory efficient).
-- If quantization not available, falls back to normal load (may be large).
+Local translator loader adapted for sail/Sailor-4B with robust handling of missing local weights.
+Key fixes:
+ - Check whether local model dir actually contains model weight files before trying to load from it.
+ - If weights are absent, load from HF model name (attempt quantized 4-bit if requested and possible).
+ - Provide clearer errors and guidance on next steps.
 """
 
 import os
 import shutil
+import glob
 from typing import Tuple, Union
 import torch
 from transformers import (
@@ -50,6 +52,31 @@ def safe_auto_tokenizer(pretrained_or_local: str, use_fast_prefer: bool = True, 
         ) from last_exc
 
 
+def model_weights_exist(local_dir: str) -> bool:
+    """Return True if the local_dir contains known model weight files."""
+    if not os.path.isdir(local_dir):
+        return False
+    # common patterns for HF model weights
+    patterns = [
+        "pytorch_model.bin",
+        "pytorch_model-*.bin",
+        "*.safetensors",
+        "tf_model.h5",
+        "flax_model.msgpack",
+        "model.ckpt",
+        "pytorch_model.pt",
+    ]
+    for pat in patterns:
+        matches = glob.glob(os.path.join(local_dir, pat))
+        if matches:
+            return True
+    # also check for shard style files e.g., pytorch_model-00001-of-00002.bin
+    shard_matches = glob.glob(os.path.join(local_dir, "pytorch_model-*of-*"))
+    if shard_matches:
+        return True
+    return False
+
+
 class Translator:
     def __init__(
         self,
@@ -62,6 +89,7 @@ class Translator:
         self.script_dir = os.path.dirname(os.path.abspath(__file__))
         self.local_base = local_base or os.path.join(self.script_dir, "local_translator_models")
         os.makedirs(self.local_base, exist_ok=True)
+        # local folder name sanitized
         self.LOCAL_MODEL_DIR = os.path.join(self.local_base, self.HF_MODEL_NAME.replace("/", "_"))
 
         if device is None:
@@ -70,17 +98,21 @@ class Translator:
             self.DEVICE = device
 
         self.prefer_4bit = prefer_4bit
+
         # ensure tokenizer saved locally (fast tokenizer if available)
         self.ensure_tokenizer_local()
 
-        # load config (from local if saved; else from HF)
+        # load config (prefer local config if present)
         try:
-            self.config = AutoConfig.from_pretrained(self.LOCAL_MODEL_DIR)
+            if model_weights_exist(self.LOCAL_MODEL_DIR):
+                self.config = AutoConfig.from_pretrained(self.LOCAL_MODEL_DIR)
+            else:
+                self.config = AutoConfig.from_pretrained(self.HF_MODEL_NAME)
         except Exception:
+            # best-effort fallback
             self.config = AutoConfig.from_pretrained(self.HF_MODEL_NAME)
 
         self.model_type = getattr(self.config, "model_type", "").lower() or "causal"
-        # Sailor is a causal-style LM derived from Qwen; we'll treat as causal.
         self.tokenizer = safe_auto_tokenizer(self.LOCAL_MODEL_DIR, use_fast_prefer=True)
 
         # now load model (quantized if possible)
@@ -89,68 +121,92 @@ class Translator:
     def ensure_tokenizer_local(self):
         """
         Ensure tokenizer files are present in LOCAL_MODEL_DIR. If not, attempt to download tokenizer only.
-        This keeps us from forcing a full-model download / save on disk.
+        This keeps us from forcing a full-model download/save on disk when the target is constrained.
         """
         if os.path.isdir(self.LOCAL_MODEL_DIR) and os.listdir(self.LOCAL_MODEL_DIR):
-            # If tokenizer.json present, assume fast tokenizer works
+            # If fast tokenizer present, we're good
             try:
                 AutoTokenizer.from_pretrained(self.LOCAL_MODEL_DIR, use_fast=True)
                 return
             except Exception:
-                # try to remove if partial or broken and redownload
-                shutil.rmtree(self.LOCAL_MODEL_DIR, ignore_errors=True)
+                # leave the dir, we'll try to (re)save tokenizer
+                pass
 
-        # Download fast tokenizer from HF and save tokenizer files locally.
+        # Download tokenizer (fast preferred) and save it locally. This will not download weights.
         tok = safe_auto_tokenizer(self.HF_MODEL_NAME, use_fast_prefer=True)
         os.makedirs(self.LOCAL_MODEL_DIR, exist_ok=True)
         tok.save_pretrained(self.LOCAL_MODEL_DIR)
-        # don't download + save full weights here (large). We'll load via from_pretrained below,
-        # possibly in quantized mode which may not be saved back to disk.
+        # do not save weights here (could be huge) — weights handled in load_model()
 
     def load_model(self):
         """
         Load the model. Priority:
-          1) If CUDA available and bitsandbytes installed & prefer_4bit: load quantized 4-bit with device_map="auto".
-          2) Else attempt standard from_pretrained to CPU/GPU depending on availability.
+          1) If CUDA available and bitsandbytes installed & prefer_4bit: load quantized 4-bit from HF directly.
+          2) Else if local weights exist: load from local folder.
+          3) Else: download from HF (non-quantized) and load.
         """
         use_cuda = (self.DEVICE == "cuda")
-        # Try quantized 4-bit load if possible
+        # 1) Try quantized 4-bit load from HF name if CUDA+bnb available & preferred
         if use_cuda and self.prefer_4bit and _HAS_BNB:
             try:
                 bnb_cfg = BitsAndBytesConfig(
                     load_in_4bit=True,
                     bnb_4bit_use_double_quant=True,
                     bnb_4bit_compute_dtype=torch.float16,
-                    quant_type="nf4"  # NF4 often gives good results on LLMs
+                    quant_type="nf4"
                 )
-                # device_map "auto" will place layers on GPU(s). This requires accelerate & bitsandbytes config supported.
                 model = AutoModelForCausalLM.from_pretrained(
                     self.HF_MODEL_NAME,
                     quantization_config=bnb_cfg,
                     device_map="auto",
-                    trust_remote_code=True,  # some models may require it
+                    trust_remote_code=True,
                 )
                 return model
             except Exception as e:
-                # fallback and inform (do not crash here — try non-quantized)
-                print("[Translator] 4-bit quantized load failed, falling back to normal load. Error:", e)
+                # Quantized load failed; continue to other options
+                print("[Translator] 4-bit quantized load failed (continuing fallback). Error:", e)
 
-        # If quantized load unavailable, attempt normal load. This may be expensive on CPU.
+        # 2) If local weights exist, try to load from local dir
+        if model_weights_exist(self.LOCAL_MODEL_DIR):
+            try:
+                model = AutoModelForCausalLM.from_pretrained(
+                    self.LOCAL_MODEL_DIR,
+                    device_map="auto" if use_cuda else None,
+                    trust_remote_code=True,
+                )
+                # ensure on CPU if requested
+                if not use_cuda:
+                    model.to("cpu")
+                return model
+            except Exception as e:
+                # If loading from local folder fails, show a helpful message and fall back to HF download
+                print(f"[Translator] Loading from local folder {self.LOCAL_MODEL_DIR} failed: {e}. Falling back to hub download.")
+
+        # 3) Download weights from HF hub (may be large)
         try:
-            # If user previously saved/checkpoint local model files, try loading from local dir first
-            if os.path.isdir(self.LOCAL_MODEL_DIR) and os.listdir(self.LOCAL_MODEL_DIR):
-                model = AutoModelForCausalLM.from_pretrained(self.LOCAL_MODEL_DIR, device_map="auto" if use_cuda else None)
-            else:
-                model = AutoModelForCausalLM.from_pretrained(self.HF_MODEL_NAME, device_map="auto" if use_cuda else None)
-            # If device_map didn't place model automatically and we are on single GPU, move to device
-            if not use_cuda:
-                # ensure model on CPU
-                model.to("cpu")
+            model = AutoModelForCausalLM.from_pretrained(
+                self.HF_MODEL_NAME,
+                device_map="auto" if use_cuda else None,
+                trust_remote_code=True,
+            )
+            # Optionally save downloaded weights for future runs (comment/uncomment as desired)
+            # saving huge weights may be undesired in constrained systems; we skip automatic save.
             return model
         except Exception as e:
+            # final helpful error: explain options
             raise RuntimeError(
                 f"Failed to load model weights for {self.HF_MODEL_NAME}. "
-                "If you intended to use quantized mode, ensure 'bitsandbytes' is installed and CUDA is available. "
+                "Possible reasons:\n"
+                " - You're offline and the local folder doesn't contain model weights.\n"
+                " - The model is large and the environment ran out of memory during load.\n"
+                " - Quantized load was requested but bitsandbytes / CUDA isn't available or failed.\n\n"
+                "Suggested fixes:\n"
+                " 1) If you have a GPU and want lower memory use, install bitsandbytes & accelerate and enable 4-bit quantization:\n"
+                "      pip install bitsandbytes accelerate\n"
+                " 2) If you cannot load the full weights on the target machine, pre-download the model on another machine\n"
+                "    (where you can install sentencepiece / bitsandbytes if needed) and copy the entire model folder\n"
+                "    into ./local_translator_models/<model_name>/ so this machine can load from local files.\n"
+                " 3) Use a smaller model (e.g., a 1.8B or 2.7B variant) if you only have CPU or limited RAM.\n\n"
                 f"Original error: {e}"
             ) from e
 
@@ -163,15 +219,14 @@ class Translator:
             "Preserve named entities when appropriate.\n\n"
             f"Chinese: {text}\n\nVietnamese:"
         )
+        # run on model device
         inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True, padding=True).to(self.model.device)
         generate_params = dict(max_new_tokens=max_new_tokens, do_sample=False, temperature=0.2)
         generate_params.update(gen_kwargs)
         outputs = self.model.generate(**inputs, **generate_params)
         decoded = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-        # try to extract text after marker
         if "Vietnamese:" in decoded:
             return decoded.split("Vietnamese:", 1)[1].strip()
-        # fallback: remove prompt prefix if present
         if decoded.startswith(prompt):
             return decoded[len(prompt):].strip()
         return decoded.strip()
