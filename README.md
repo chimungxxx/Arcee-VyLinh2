@@ -52,7 +52,7 @@ MIT License
 
 Note: You'll also need a `requirements.txt` file with the necessary dependencies:
 
-```
+```txt
 streamlit
 transformers
 torch
